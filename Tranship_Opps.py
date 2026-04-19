@@ -1,21 +1,6 @@
 # app.py
 # Tranship Ops Dashboard
 # Streamlit + SQLite + POP PDF parser
-#
-# What this app does
-# - Admin login with 4-digit PIN
-# - Admin can upload OCC POP PDF sheets to generate arrival tasks
-# - Admin can create users, delete users, and download reports
-# - Team members login with their own 4-digit PIN
-# - Team members can assign flights to themselves
-# - Status flow: Unassigned -> Assigned -> AC Met -> Completed / Skipped
-# - Skipped reasons: No Transfers / Not Prioritised Due Peak / Other
-#
-# Install:
-# pip install streamlit pandas pdfplumber
-#
-# Run:
-# streamlit run app.py
 
 from __future__ import annotations
 
@@ -37,8 +22,6 @@ import streamlit as st
 # ------------------------------------------------------------
 
 DB_PATH = "tranship_ops.db"
-
-# Change this before production use
 ADMIN_PIN = os.getenv("TRANSHIP_ADMIN_PIN", "0000")
 
 SKIP_REASONS = [
@@ -151,11 +134,15 @@ def today_str() -> str:
 
 
 def normalize_flight(prefix: str, raw_number: str) -> str:
-    # QFA 0036 -> QF36
     number = raw_number.strip()
+    prefix = prefix.strip().upper()
+
+    if prefix == "QFA":
+        prefix = "QF"
+
     try:
         number_int = int(number)
-        return f"QF{number_int}"
+        return f"{prefix}{number_int}"
     except ValueError:
         return f"{prefix}{number}".replace(" ", "")
 
@@ -179,6 +166,10 @@ def ensure_session_defaults() -> None:
         st.session_state.username = None
     if "pin" not in st.session_state:
         st.session_state.pin = ""
+    if "confirm_clear_data" not in st.session_state:
+        st.session_state.confirm_clear_data = False
+    if "confirm_delete_active" not in st.session_state:
+        st.session_state.confirm_delete_active = False
 
 
 # ------------------------------------------------------------
@@ -195,7 +186,6 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 def detect_pop_date(text: str) -> str:
-    # Matches: 14.04.2026
     m = re.search(r"Date:\s*(\d{2}\.\d{2}\.\d{4})", text)
     if not m:
         return today_str()
@@ -207,34 +197,100 @@ def detect_pop_date(text: str) -> str:
         return today_str()
 
 
+def clean_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").strip()
+
+
+def looks_like_time(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}:\d{2}", value.strip()))
+
+
+def looks_like_flight_prefix(value: str) -> bool:
+    return value.strip().upper() in {"QFA", "QF"}
+
+
+def parse_arrivals_from_tables(file_bytes: bytes, source_file: str) -> list[ParsedArrival]:
+    arrivals: list[ParsedArrival] = []
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        full_text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+        task_date = detect_pop_date(full_text)
+
+        for page in pdf.pages:
+            tables = page.extract_tables() or []
+            for table in tables:
+                if not table:
+                    continue
+
+                for row in table:
+                    cells = [clean_cell(c) for c in row if clean_cell(c) != ""]
+
+                    # Expecting rows like:
+                    # QFA | 0036 | I | SIN | 05:35 | VHEBK | 269
+                    if len(cells) < 5:
+                        continue
+
+                    # Skip headers / junk rows
+                    joined = " ".join(cells).upper()
+                    if "FLIGHT" in joined and "ROUTE" in joined:
+                        continue
+                    if joined.startswith("DEPARTURE"):
+                        continue
+                    if joined.startswith("ARRIVALS"):
+                        continue
+                    if joined.startswith("PORT OPERATING PLAN"):
+                        continue
+
+                    prefix = cells[0].upper()
+
+                    if not looks_like_flight_prefix(prefix):
+                        continue
+
+                    raw_number = cells[1]
+                    flight_type_code = cells[2].upper()
+                    route = cells[3].upper()
+                    sta = cells[4]
+
+                    if flight_type_code not in TYPE_LABELS:
+                        continue
+                    if not re.fullmatch(r"\d{3,4}", raw_number):
+                        continue
+                    if not re.fullmatch(r"[A-Z]{3}", route):
+                        continue
+                    if not looks_like_time(sta):
+                        continue
+
+                    arrivals.append(
+                        ParsedArrival(
+                            task_date=task_date,
+                            flight=normalize_flight(prefix, raw_number),
+                            flight_type=TYPE_LABELS[flight_type_code],
+                            route=route,
+                            sta=sta,
+                            source_file=source_file,
+                        )
+                    )
+
+    deduped = {
+        (a.task_date, a.flight, a.flight_type, a.route, a.sta): a
+        for a in arrivals
+    }
+    return list(deduped.values())
+
+
 def parse_arrivals_from_text(text: str, source_file: str) -> list[ParsedArrival]:
-    """
-    Parses lines from POP PDFs like:
-    QFA 0036 I SIN 05:35 VHEBK 269
-    QFA 0401 D SYD 07:35 VHVYL 115
-    QFA 1519 R CBR 07:20 VHX4K 76
-    """
     task_date = detect_pop_date(text)
     arrivals: list[ParsedArrival] = []
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    in_arrivals = False
 
     line_regex = re.compile(
-        r"^(QFA)\s+(\d{3,4})\s+([IDR])\s+([A-Z]{3})\s+(\d{2}:\d{2})\s+([A-Z0-9]+)\s+(\d+)$"
+        r"^(QFA|QF)\s+(\d{3,4})\s+([IDR])\s+([A-Z]{3})\s+(\d{2}:\d{2})\s+([A-Z0-9]+)\s+(\d+)$"
     )
 
     for line in lines:
-        if line.startswith("Arrivals"):
-            in_arrivals = True
-            continue
-
-        if in_arrivals and line.startswith("Departure"):
-            break
-
-        if not in_arrivals:
-            continue
-
         m = line_regex.match(line)
         if not m:
             continue
@@ -252,13 +308,24 @@ def parse_arrivals_from_text(text: str, source_file: str) -> list[ParsedArrival]
             )
         )
 
-    return arrivals
+    deduped = {
+        (a.task_date, a.flight, a.flight_type, a.route, a.sta): a
+        for a in arrivals
+    }
+    return list(deduped.values())
 
 
 def parse_pop_pdf(uploaded_file) -> list[ParsedArrival]:
     file_bytes = uploaded_file.read()
+
+    arrivals = parse_arrivals_from_tables(file_bytes, uploaded_file.name)
+    if arrivals:
+        return sorted(arrivals, key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight))
+
+    # fallback if table extraction fails
     text = extract_pdf_text(file_bytes)
-    return parse_arrivals_from_text(text, uploaded_file.name)
+    arrivals = parse_arrivals_from_text(text, uploaded_file.name)
+    return sorted(arrivals, key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight))
 
 
 # ------------------------------------------------------------
@@ -348,7 +415,7 @@ def insert_tasks(parsed_arrivals: Iterable[ParsedArrival]) -> tuple[int, int]:
     return inserted, skipped
 
 
-def get_tasks(task_date: str | None = None) -> list[sqlite3.Row]:
+def get_tasks(task_date: str | None = None, include_history: bool = True) -> list[sqlite3.Row]:
     sql = "SELECT * FROM tasks"
     params: list[Any] = []
 
@@ -360,6 +427,9 @@ def get_tasks(task_date: str | None = None) -> list[sqlite3.Row]:
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
+
+    if not include_history:
+        rows = [r for r in rows if r["status"] not in ("Completed", "Skipped")]
 
     return sorted(
         rows,
@@ -480,6 +550,31 @@ def skip_task(
         conn.commit()
 
 
+def recall_task(task_id: int) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'Unassigned',
+                assigned_to = NULL,
+                assigned_at = NULL,
+                ac_met_by = NULL,
+                ac_met_at = NULL,
+                completed_by = NULL,
+                completed_at = NULL,
+                skipped_by = NULL,
+                skipped_at = NULL,
+                skip_reason = NULL,
+                skip_other_reason = NULL
+            WHERE id = ?
+              AND status IN ('Completed', 'Skipped')
+            """,
+            (task_id,),
+        )
+        conn.commit()
+
+
 def get_report_dataframe() -> pd.DataFrame:
     with closing(get_conn()) as conn:
         df = pd.read_sql_query(
@@ -511,6 +606,20 @@ def get_report_dataframe() -> pd.DataFrame:
             conn,
         )
     return df
+
+
+def clear_all_task_data() -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks")
+        conn.commit()
+
+
+def delete_all_active_tasks() -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE status NOT IN ('Completed', 'Skipped')")
+        conn.commit()
 
 
 # ------------------------------------------------------------
@@ -576,7 +685,7 @@ def status_pill_html(status: str) -> str:
 
 
 # ------------------------------------------------------------
-# RENDER LOGIN
+# LOGIN
 # ------------------------------------------------------------
 
 def render_login() -> None:
@@ -613,9 +722,56 @@ def logout() -> None:
 # ADMIN UI
 # ------------------------------------------------------------
 
+def render_admin_active_flights() -> None:
+    st.subheader("Live Active Flights")
+    active_tasks = get_tasks(include_history=False)
+
+    if not active_tasks:
+        st.info("No active flights loaded.")
+        return
+
+    rows = []
+    for task in active_tasks:
+        rows.append(
+            {
+                "Date": task["task_date"],
+                "Flight": task["flight"],
+                "Type": task["flight_type"],
+                "Route": f"{task['route']} - MEL",
+                "STA": task["sta"],
+                "Status": task["status"],
+                "Assigned To": task["assigned_to"] or "",
+                "AC Met By": task["ac_met_by"] or "",
+            }
+        )
+
+    df = pd.DataFrame(rows).sort_values(by=["Date", "STA", "Flight"])
+    st.dataframe(df, use_container_width=True, height=350)
+
+    st.markdown("### Delete All Active Flights")
+    st.warning("This removes all active tasks and keeps completed/skipped history untouched.")
+
+    if not st.session_state.confirm_delete_active:
+        if st.button("Delete All Active Flights", use_container_width=True):
+            st.session_state.confirm_delete_active = True
+            st.rerun()
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Confirm Delete Active Flights", use_container_width=True):
+                delete_all_active_tasks()
+                st.session_state.confirm_delete_active = False
+                st.success("All active flights deleted.")
+                st.rerun()
+        with c2:
+            if st.button("Cancel", key="cancel_delete_active", use_container_width=True):
+                st.session_state.confirm_delete_active = False
+                st.rerun()
+
+
 def render_admin() -> None:
     st.title("Admin")
-    st.caption("Upload POP sheets, manage users, and download reports.")
+    st.caption("Upload POP sheets, manage users, monitor active flights, and download reports.")
 
     col1, col2 = st.columns([4, 1])
     with col1:
@@ -624,9 +780,8 @@ def render_admin() -> None:
         if st.button("Logout", use_container_width=True):
             logout()
 
-    tabs = st.tabs(["POP Upload", "Users", "Reports"])
+    tabs = st.tabs(["POP Upload", "Users", "Active Flights", "Reports"])
 
-    # ---------------- POP Upload ----------------
     with tabs[0]:
         st.subheader("Upload OCC POP PDFs")
         uploaded_files = st.file_uploader(
@@ -653,7 +808,7 @@ def render_admin() -> None:
                                 "Date": a.task_date,
                                 "Flight": a.flight,
                                 "Type": a.flight_type,
-                                "Route": a.route,
+                                "Route": f"{a.route} - MEL",
                                 "STA": a.sta,
                                 "Source": a.source_file,
                             }
@@ -670,7 +825,6 @@ def render_admin() -> None:
                 preview_df = preview_df.sort_values(by=["Date", "STA", "Flight"])
                 st.dataframe(preview_df, use_container_width=True)
 
-    # ---------------- Users ----------------
     with tabs[1]:
         st.subheader("Create User")
 
@@ -704,8 +858,10 @@ def render_admin() -> None:
                         st.success(f"Deleted {user['username']}.")
                         st.rerun()
 
-    # ---------------- Reports ----------------
     with tabs[2]:
+        render_admin_active_flights()
+
+    with tabs[3]:
         st.subheader("Download Report")
         report_df = get_report_dataframe()
 
@@ -722,6 +878,26 @@ def render_admin() -> None:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+            st.markdown("### Clear Flight Data")
+            st.warning("Use this after downloading the report if you want to reset all task data.")
+
+            if not st.session_state.confirm_clear_data:
+                if st.button("Clear Flight Data", use_container_width=True):
+                    st.session_state.confirm_clear_data = True
+                    st.rerun()
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Confirm Clear All Flight Data", use_container_width=True):
+                        clear_all_task_data()
+                        st.session_state.confirm_clear_data = False
+                        st.success("All flight data cleared.")
+                        st.rerun()
+                with c2:
+                    if st.button("Cancel", key="cancel_clear_data", use_container_width=True):
+                        st.session_state.confirm_clear_data = False
+                        st.rerun()
 
 
 # ------------------------------------------------------------
@@ -753,7 +929,7 @@ def render_summary_boxes(tasks: list[sqlite3.Row]) -> None:
             )
 
 
-def render_task_card(task: sqlite3.Row, current_user: str) -> None:
+def render_task_card(task: sqlite3.Row, current_user: str, history_mode: bool = False) -> None:
     st.markdown("<div class='task-card'>", unsafe_allow_html=True)
 
     st.markdown(
@@ -789,7 +965,17 @@ def render_task_card(task: sqlite3.Row, current_user: str) -> None:
     if task["notes"]:
         st.caption(f"Notes: {task['notes']}")
 
-    # ACTIONS
+    if history_mode:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Recall Task", key=f"recall_{task['id']}", use_container_width=True):
+                recall_task(task["id"])
+                st.rerun()
+        with c2:
+            st.empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
     if task["status"] == "Unassigned":
         c1, c2 = st.columns([1, 1])
 
@@ -882,60 +1068,115 @@ def render_user() -> None:
 
     render_summary_boxes(all_tasks)
 
-    # Filters
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        selected_date = st.selectbox(
-            "Date",
-            options=sorted({t["task_date"] for t in all_tasks}),
-            index=0,
-        )
-    with c2:
-        selected_type = st.selectbox("Flight Type", ["ALL", "INT", "DOM", "QLK"], index=0)
-    with c3:
-        selected_view = st.selectbox(
-            "View",
-            ["ALL", "UNASSIGNED", "MY TASKS", "COMPLETED", "SKIPPED"],
-            index=0,
-        )
-
-    tasks = [t for t in all_tasks if t["task_date"] == selected_date]
-
-    if selected_type != "ALL":
-        tasks = [t for t in tasks if t["flight_type"] == selected_type]
+    tabs = st.tabs(["Active Flights", "History"])
 
     current_user = st.session_state.username
 
-    if selected_view == "UNASSIGNED":
-        tasks = [t for t in tasks if t["status"] == "Unassigned"]
-    elif selected_view == "MY TASKS":
-        tasks = [
-            t for t in tasks
-            if t["assigned_to"] == current_user and t["status"] in ("Assigned", "AC Met")
+    with tabs[0]:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            selected_date = st.selectbox(
+                "Date",
+                options=sorted({t["task_date"] for t in all_tasks}),
+                index=0,
+                key="active_date",
+            )
+        with c2:
+            selected_type = st.selectbox("Flight Type", ["ALL", "INT", "DOM", "QLK"], index=0, key="active_type")
+        with c3:
+            selected_view = st.selectbox(
+                "View",
+                ["ALL", "UNASSIGNED", "MY TASKS"],
+                index=0,
+                key="active_view",
+            )
+
+        active_tasks = [
+            t for t in all_tasks
+            if t["task_date"] == selected_date and t["status"] not in ("Completed", "Skipped")
         ]
-    elif selected_view == "COMPLETED":
-        tasks = [t for t in tasks if t["status"] == "Completed"]
-    elif selected_view == "SKIPPED":
-        tasks = [t for t in tasks if t["status"] == "Skipped"]
 
-    tasks = sorted(
-        tasks,
-        key=lambda r: (
-            sort_sta_value(r["sta"]),
-            status_rank(r["status"]),
-            r["flight_type"],
-            r["flight"],
-        ),
-    )
+        if selected_type != "ALL":
+            active_tasks = [t for t in active_tasks if t["flight_type"] == selected_type]
 
-    if not tasks:
-        st.info("No tasks match the current filters.")
-        return
+        if selected_view == "UNASSIGNED":
+            active_tasks = [t for t in active_tasks if t["status"] == "Unassigned"]
+        elif selected_view == "MY TASKS":
+            active_tasks = [
+                t for t in active_tasks
+                if t["assigned_to"] == current_user and t["status"] in ("Assigned", "AC Met")
+            ]
 
-    st.divider()
-    for task in tasks:
-        render_task_card(task, current_user)
+        active_tasks = sorted(
+            active_tasks,
+            key=lambda r: (
+                sort_sta_value(r["sta"]),
+                status_rank(r["status"]),
+                r["flight_type"],
+                r["flight"],
+            ),
+        )
+
+        if not active_tasks:
+            st.info("No active tasks match the current filters.")
+        else:
+            for task in active_tasks:
+                render_task_card(task, current_user, history_mode=False)
+
+    with tabs[1]:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            selected_date_hist = st.selectbox(
+                "Date",
+                options=sorted({t["task_date"] for t in all_tasks}),
+                index=0,
+                key="history_date",
+            )
+        with c2:
+            selected_type_hist = st.selectbox("Flight Type", ["ALL", "INT", "DOM", "QLK"], index=0, key="history_type")
+        with c3:
+            selected_history_view = st.selectbox(
+                "History View",
+                ["ALL HISTORY", "COMPLETED", "SKIPPED", "MY HISTORY"],
+                index=0,
+                key="history_view",
+            )
+
+        history_tasks = [
+            t for t in all_tasks
+            if t["task_date"] == selected_date_hist and t["status"] in ("Completed", "Skipped")
+        ]
+
+        if selected_type_hist != "ALL":
+            history_tasks = [t for t in history_tasks if t["flight_type"] == selected_type_hist]
+
+        if selected_history_view == "COMPLETED":
+            history_tasks = [t for t in history_tasks if t["status"] == "Completed"]
+        elif selected_history_view == "SKIPPED":
+            history_tasks = [t for t in history_tasks if t["status"] == "Skipped"]
+        elif selected_history_view == "MY HISTORY":
+            history_tasks = [
+                t for t in history_tasks
+                if t["assigned_to"] == current_user
+                or t["completed_by"] == current_user
+                or t["skipped_by"] == current_user
+            ]
+
+        history_tasks = sorted(
+            history_tasks,
+            key=lambda r: (
+                sort_sta_value(r["sta"]),
+                status_rank(r["status"]),
+                r["flight_type"],
+                r["flight"],
+            ),
+        )
+
+        if not history_tasks:
+            st.info("No history items match the current filters.")
+        else:
+            for task in history_tasks:
+                render_task_card(task, current_user, history_mode=True)
 
 
 # ------------------------------------------------------------
