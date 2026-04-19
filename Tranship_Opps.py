@@ -962,6 +962,7 @@ def logout() -> None:
 def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
 
+    # Auto refresh every 15 seconds
     st.markdown(
         """
         <meta http-equiv="refresh" content="15">
@@ -978,121 +979,65 @@ def render_admin_active_flights() -> None:
         st.info("No active flights loaded.")
         return
 
-    # Filters
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        selected_date = st.selectbox(
-            "Date",
-            options=sorted({t["task_date"] for t in active_tasks}),
-            index=0,
-            key="admin_active_date",
-        )
-    with c2:
-        selected_type = st.selectbox(
-            "Flight Type",
-            ["ALL", "INT", "DOM", "QLK"],
-            index=0,
-            key="admin_active_type",
-        )
-    with c3:
-        selected_status = st.selectbox(
-            "Status",
-            ["ALL", "Unassigned", "Assigned", "AC Met", "Completed", "Skipped"],
-            index=0,
-            key="admin_active_status",
-        )
-
-    filtered = [t for t in active_tasks if t["task_date"] == selected_date]
-
-    if selected_type != "ALL":
-        filtered = [t for t in filtered if t["flight_type"] == selected_type]
-
-    if selected_status != "ALL":
-        filtered = [t for t in filtered if t["status"] == selected_status]
-
-    filtered = sorted(
-        filtered,
+    # Sort by date, STA, then flight
+    active_tasks = sorted(
+        active_tasks,
         key=lambda r: (
+            r["task_date"],
             sort_sta_value(r["sta"]),
             r["flight_type"],
             r["flight"],
         ),
     )
 
-    st.markdown("<div class='board-wrap'>", unsafe_allow_html=True)
+    for task in active_tasks:
+        bg = admin_row_colour(task["status"])
 
-    for task in filtered:
-        board_class = admin_board_class(task["status"])
-        status_class = admin_status_class(task["status"])
+        assigned_text = task["assigned_to"] if task["assigned_to"] else "-"
+        ac_met_text = task["ac_met_by"] if task["ac_met_by"] else "-"
+        completed_text = task["completed_by"] if task["completed_by"] else "-"
+        skipped_text = task["skipped_by"] if task["skipped_by"] else "-"
 
-        skip_reason = ""
+        extra_line = ""
         if task["status"] == "Skipped":
-            skip_reason = task["skip_reason"] or ""
-            if skip_reason == "Other" and task["skip_other_reason"]:
-                skip_reason = f"{skip_reason} - {task['skip_other_reason']}"
+            reason = task["skip_reason"] or ""
+            if reason == "Other" and task["skip_other_reason"]:
+                reason = f"{reason} - {task['skip_other_reason']}"
+            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Skip reason: {reason}</div>"
 
-        note_lines = []
         if task["status"] == "Completed" and task["completed_at"]:
-            note_lines.append(f"Completed at: {task['completed_at']}")
-        if task["status"] == "Skipped" and skip_reason:
-            note_lines.append(f"Skip reason: {skip_reason}")
-        if task["notes"]:
-            note_lines.append(f"Notes: {task['notes']}")
-
-        note_html = ""
-        if note_lines:
-            note_html = "<div class='board-note'>" + "<br>".join(note_lines) + "</div>"
+            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Completed at: {task['completed_at']}</div>"
 
         st.markdown(
             f"""
-            <div class="board-card {board_class}">
-                <div class="board-top">
-                    <div class="board-flight">{task['flight']} {task['route']} - MEL</div>
-                    <div class="board-status {status_class}">{task['status']}</div>
+            <div style="
+                background:{bg};
+                border:1px solid #d6dbe1;
+                border-radius:12px;
+                padding:14px;
+                margin-bottom:12px;
+            ">
+                <div style="font-size:1.1rem; font-weight:700; margin-bottom:6px;">
+                    {task['flight']} {task['route']} - MEL
                 </div>
-
-                <div class="board-meta">
-                    <div class="meta-chip">Type: {task['flight_type']}</div>
-                    <div class="meta-chip">STA: {task['sta']}</div>
-                    <div class="meta-chip">Date: {task['task_date']}</div>
-                    {f"<div class='meta-chip'>Gate: {task['gate']}</div>" if task['gate'] else ""}
+                <div style="font-size:0.95rem; margin-bottom:6px;">
+                    <strong>Status:</strong> {task['status']} |
+                    <strong>Type:</strong> {task['flight_type']} |
+                    <strong>STA:</strong> {task['sta']} |
+                    <strong>Date:</strong> {task['task_date']}
                 </div>
-
-                <div class="board-grid">
-                    <div class="board-field">
-                        <div class="board-label">Assigned To</div>
-                        <div class="board-value">{task['assigned_to'] or '-'}</div>
-                    </div>
-                    <div class="board-field">
-                        <div class="board-label">Assigned At</div>
-                        <div class="board-value">{task['assigned_at'] or '-'}</div>
-                    </div>
-                    <div class="board-field">
-                        <div class="board-label">AC Met By</div>
-                        <div class="board-value">{task['ac_met_by'] or '-'}</div>
-                    </div>
-                    <div class="board-field">
-                        <div class="board-label">AC Met At</div>
-                        <div class="board-value">{task['ac_met_at'] or '-'}</div>
-                    </div>
-                    <div class="board-field">
-                        <div class="board-label">Completed By</div>
-                        <div class="board-value">{task['completed_by'] or '-'}</div>
-                    </div>
-                    <div class="board-field">
-                        <div class="board-label">Skipped By</div>
-                        <div class="board-value">{task['skipped_by'] or '-'}</div>
-                    </div>
+                <div style="font-size:0.92rem; color:#333;">
+                    <strong>Assigned:</strong> {assigned_text} |
+                    <strong>AC Met:</strong> {ac_met_text} |
+                    <strong>Completed:</strong> {completed_text} |
+                    <strong>Skipped:</strong> {skipped_text}
                 </div>
-
-                {note_html}
+                {extra_line}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
     st.markdown("### Delete All Active Flights")
     st.warning("This removes all live active tasks. Completed/skipped history remains available in reports.")
 
@@ -1112,25 +1057,8 @@ def render_admin_active_flights() -> None:
             if st.button("Cancel", key="cancel_delete_active", use_container_width=True):
                 st.session_state.confirm_delete_active = False
                 st.rerun()
-    st.markdown("### Delete All Active Flights")
-    st.warning("This removes all live active tasks. Completed/skipped history remains available in reports.")
 
-    if not st.session_state.confirm_delete_active:
-        if st.button("Delete All Active Flights", use_container_width=True):
-            st.session_state.confirm_delete_active = True
-            st.rerun()
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Confirm Delete Active Flights", use_container_width=True):
-                delete_all_active_tasks()
-                st.session_state.confirm_delete_active = False
-                st.success("Active flights deleted.")
-                st.rerun()
-        with c2:
-            if st.button("Cancel", key="cancel_delete_active", use_container_width=True):
-                st.session_state.confirm_delete_active = False
-                st.rerun()
+
 def render_admin() -> None:
     st.title("Admin")
     st.caption("Upload POP sheets, manage users, monitor active flights, and download reports.")
