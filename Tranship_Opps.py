@@ -976,7 +976,7 @@ def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
 
     # Auto refresh every 15 seconds
-    st_autorefresh(interval=15000, key="admin_live_refresh")
+    st_autorefresh(interval=5000, key="admin_live_refresh")
 
     all_tasks = get_tasks()
     active_tasks = [t for t in all_tasks if should_show_on_admin_active(t)]
