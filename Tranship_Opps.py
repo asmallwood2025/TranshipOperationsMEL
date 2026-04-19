@@ -892,7 +892,7 @@ def render_login():
     if "pin_input" not in st.session_state:
         st.session_state.pin_input = ""
 
-    # Display entered PIN (masked)
+    # Display entered PIN
     st.markdown(
         f"""
         <div style="
@@ -919,28 +919,27 @@ def render_login():
 
         if pin == ADMIN_PIN:
             st.session_state.role = "admin"
-            st.session_state.username = "admin"
+            st.session_state.username = "Admin"
+            st.session_state.pin = pin
             st.session_state.pin_input = ""
             st.rerun()
 
-        elif pin in STATIC_USERS.values():
-            # find username from pin
-            for user, user_pin in STATIC_USERS.items():
-                if user_pin == pin:
-                    st.session_state.role = "user"
-                    st.session_state.username = user
-                    st.session_state.pin_input = ""
-                    st.rerun()
-        else:
-            st.error("Invalid PIN")
+        user = get_user_by_pin(pin)
+        if user:
+            st.session_state.role = "user"
+            st.session_state.username = user["username"]
+            st.session_state.pin = pin
             st.session_state.pin_input = ""
+            st.rerun()
 
-    # Keypad layout
+        st.error("Invalid PIN")
+        st.session_state.pin_input = ""
+
     keypad = [
-        [1,2,3],
-        [4,5,6],
-        [7,8,9],
-        ["C",0,"OK"]
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+        ["C", 0, "OK"],
     ]
 
     for row in keypad:
@@ -948,19 +947,19 @@ def render_login():
         for i, val in enumerate(row):
             with cols[i]:
                 if val == "C":
-                    if st.button("Clear", use_container_width=True):
+                    if st.button("Clear", key=f"key_{val}_{i}_{len(st.session_state.pin_input)}", use_container_width=True):
                         clear_pin()
+                        st.rerun()
                 elif val == "OK":
-                    if st.button("Enter", use_container_width=True):
+                    if st.button("Enter", key=f"key_{val}_{i}_{len(st.session_state.pin_input)}", use_container_width=True):
                         submit_pin()
                 else:
-                    if st.button(str(val), use_container_width=True):
+                    if st.button(str(val), key=f"key_{val}_{i}_{len(st.session_state.pin_input)}", use_container_width=True):
                         add_digit(val)
-
-    # Auto-submit when 4 digits entered
-    if len(st.session_state.pin_input) == 4:
-        submit_pin()
-
+                        if len(st.session_state.pin_input) == 4:
+                            submit_pin()
+                        else:
+                            st.rerun()
 
 def logout() -> None:
     st.session_state.role = None
