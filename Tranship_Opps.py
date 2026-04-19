@@ -1311,6 +1311,12 @@ def render_user() -> None:
     current_user = st.session_state.username
 
     with tabs[0]:
+        with tab1:
+        st_autorefresh(interval=5000, key="user_active_refresh")
+
+        active_tasks = get_tasks(include_history=False)
+
+    # your existing sorting + rendering logic continues here
         c1, c2, c3 = st.columns(3)
         with c1:
             selected_date = st.selectbox(
