@@ -699,12 +699,19 @@ def delete_all_active_tasks() -> None:
 
 
 # ------------------------------------------------------------
-# UI STYLES
+# UI STYLES CSS
 # ------------------------------------------------------------
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
+        .stButton > button {
+            height: 80px;
+            front-size: 1.5rem;
+            border-radius: 16px;
+            font-weight:700;
+        }
+        
         .stApp {
             background-color: #ffffff;
         }
@@ -879,28 +886,80 @@ def status_pill_html(status: str) -> str:
 # ------------------------------------------------------------
 # LOGIN
 # ------------------------------------------------------------
+def render_login():
+    st.title("Enter PIN")
 
-def render_login() -> None:
-    st.title("Tranship Ops Dashboard")
-    st.caption("Enter your 4-digit code")
+    if "pin_input" not in st.session_state:
+        st.session_state.pin_input = ""
 
-    pin = st.text_input("PIN", type="password", max_chars=4)
+    # Display entered PIN (masked)
+    st.markdown(
+        f"""
+        <div style="
+            font-size: 2rem;
+            text-align: center;
+            margin-bottom: 20px;
+            letter-spacing: 10px;
+        ">
+            {"●" * len(st.session_state.pin_input)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if st.button("Login", use_container_width=True):
+    def add_digit(d):
+        if len(st.session_state.pin_input) < 4:
+            st.session_state.pin_input += str(d)
+
+    def clear_pin():
+        st.session_state.pin_input = ""
+
+    def submit_pin():
+        pin = st.session_state.pin_input
+
         if pin == ADMIN_PIN:
             st.session_state.role = "admin"
-            st.session_state.username = "Admin"
-            st.session_state.pin = pin
+            st.session_state.username = "admin"
+            st.session_state.pin_input = ""
             st.rerun()
 
-        user = get_user_by_pin(pin)
-        if user:
-            st.session_state.role = "user"
-            st.session_state.username = user["username"]
-            st.session_state.pin = pin
-            st.rerun()
+        elif pin in STATIC_USERS.values():
+            # find username from pin
+            for user, user_pin in STATIC_USERS.items():
+                if user_pin == pin:
+                    st.session_state.role = "user"
+                    st.session_state.username = user
+                    st.session_state.pin_input = ""
+                    st.rerun()
+        else:
+            st.error("Invalid PIN")
+            st.session_state.pin_input = ""
 
-        st.error("Invalid PIN.")
+    # Keypad layout
+    keypad = [
+        [1,2,3],
+        [4,5,6],
+        [7,8,9],
+        ["C",0,"OK"]
+    ]
+
+    for row in keypad:
+        cols = st.columns(3)
+        for i, val in enumerate(row):
+            with cols[i]:
+                if val == "C":
+                    if st.button("Clear", use_container_width=True):
+                        clear_pin()
+                elif val == "OK":
+                    if st.button("Enter", use_container_width=True):
+                        submit_pin()
+                else:
+                    if st.button(str(val), use_container_width=True):
+                        add_digit(val)
+
+    # Auto-submit when 4 digits entered
+    if len(st.session_state.pin_input) == 4:
+        submit_pin()
 
 
 def logout() -> None:
