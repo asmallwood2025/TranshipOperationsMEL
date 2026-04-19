@@ -127,52 +127,6 @@ class ParsedArrival:
 # ------------------------------------------------------------
 
 
-def should_show_on_admin_active(task: sqlite3.Row) -> bool:
-    status = task["status"]
-
-    if status in ("Unassigned", "Assigned", "AC Met", "Skipped"):
-        return True
-
-    if status == "Completed":
-        completed_at = task["completed_at"]
-        if not completed_at:
-            return False
-        try:
-            completed_dt = datetime.strptime(completed_at, "%Y-%m-%d %H:%M:%S")
-            return datetime.now() <= completed_dt + timedelta(minutes=5)
-        except ValueError:
-            return False
-
-    return False
-
-
-def admin_board_class(status: str) -> str:
-    if status == "Unassigned":
-        return "unassigned"
-    if status == "Assigned":
-        return "assigned"
-    if status == "AC Met":
-        return "met"
-    if status == "Completed":
-        return "completed"
-    if status == "Skipped":
-        return "skipped"
-    return "unassigned"
-
-
-def admin_status_class(status: str) -> str:
-    if status == "Unassigned":
-        return "status-unassigned"
-    if status == "Assigned":
-        return "status-assigned"
-    if status == "AC Met":
-        return "status-met"
-    if status == "Completed":
-        return "status-completed"
-    if status == "Skipped":
-        return "status-skipped"
-    return "status-unassigned"
-
 
 
 def should_show_on_admin_active(task: sqlite3.Row) -> bool:
