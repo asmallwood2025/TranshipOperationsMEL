@@ -1,0 +1,960 @@
+# app.py
+# Tranship Ops Dashboard
+# Streamlit + SQLite + POP PDF parser
+#
+# What this app does
+# - Admin login with 4-digit PIN
+# - Admin can upload OCC POP PDF sheets to generate arrival tasks
+# - Admin can create users, delete users, and download reports
+# - Team members login with their own 4-digit PIN
+# - Team members can assign flights to themselves
+# - Status flow: Unassigned -> Assigned -> AC Met -> Completed / Skipped
+# - Skipped reasons: No Transfers / Not Prioritised Due Peak / Other
+#
+# Install:
+# pip install streamlit pandas pdfplumber
+#
+# Run:
+# streamlit run app.py
+
+from __future__ import annotations
+
+import io
+import os
+import re
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Any, Iterable
+
+import pandas as pd
+import pdfplumber
+import streamlit as st
+
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+
+DB_PATH = "tranship_ops.db"
+
+# Change this before production use
+ADMIN_PIN = os.getenv("TRANSHIP_ADMIN_PIN", "0000")
+
+SKIP_REASONS = [
+    "No Transfers",
+    "Not Prioritised Due Peak",
+    "Other",
+]
+
+STATUS_ORDER = {
+    "Unassigned": 1,
+    "Assigned": 2,
+    "AC Met": 3,
+    "Completed": 4,
+    "Skipped": 5,
+}
+
+TYPE_LABELS = {
+    "I": "INT",
+    "D": "DOM",
+    "R": "QLK",
+}
+
+# ------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                pin TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_date TEXT NOT NULL,
+                flight TEXT NOT NULL,
+                flight_type TEXT NOT NULL,
+                route TEXT NOT NULL,
+                sta TEXT NOT NULL,
+                gate TEXT,
+                source_file TEXT,
+                status TEXT NOT NULL DEFAULT 'Unassigned',
+
+                assigned_to TEXT,
+                assigned_at TEXT,
+
+                ac_met_by TEXT,
+                ac_met_at TEXT,
+
+                completed_by TEXT,
+                completed_at TEXT,
+
+                skipped_by TEXT,
+                skipped_at TEXT,
+                skip_reason TEXT,
+                skip_other_reason TEXT,
+
+                notes TEXT,
+                created_at TEXT NOT NULL,
+
+                UNIQUE(task_date, flight, flight_type, sta)
+            )
+            """
+        )
+
+        conn.commit()
+
+
+# ------------------------------------------------------------
+# DATA MODELS
+# ------------------------------------------------------------
+
+@dataclass
+class ParsedArrival:
+    task_date: str
+    flight: str
+    flight_type: str
+    route: str
+    sta: str
+    source_file: str
+
+
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
+
+def normalize_flight(prefix: str, raw_number: str) -> str:
+    # QFA 0036 -> QF36
+    number = raw_number.strip()
+    try:
+        number_int = int(number)
+        return f"QF{number_int}"
+    except ValueError:
+        return f"{prefix}{number}".replace(" ", "")
+
+
+def sort_sta_value(sta: str) -> tuple[int, int]:
+    try:
+        hh, mm = sta.split(":")
+        return int(hh), int(mm)
+    except Exception:
+        return 99, 99
+
+
+def status_rank(status: str) -> int:
+    return STATUS_ORDER.get(status, 99)
+
+
+def ensure_session_defaults() -> None:
+    if "role" not in st.session_state:
+        st.session_state.role = None
+    if "username" not in st.session_state:
+        st.session_state.username = None
+    if "pin" not in st.session_state:
+        st.session_state.pin = ""
+
+
+# ------------------------------------------------------------
+# PDF PARSING
+# ------------------------------------------------------------
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    text_chunks: list[str] = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            text_chunks.append(page_text)
+    return "\n".join(text_chunks)
+
+
+def detect_pop_date(text: str) -> str:
+    # Matches: 14.04.2026
+    m = re.search(r"Date:\s*(\d{2}\.\d{2}\.\d{4})", text)
+    if not m:
+        return today_str()
+
+    raw = m.group(1)
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return today_str()
+
+
+def parse_arrivals_from_text(text: str, source_file: str) -> list[ParsedArrival]:
+    """
+    Parses lines from POP PDFs like:
+    QFA 0036 I SIN 05:35 VHEBK 269
+    QFA 0401 D SYD 07:35 VHVYL 115
+    QFA 1519 R CBR 07:20 VHX4K 76
+    """
+    task_date = detect_pop_date(text)
+    arrivals: list[ParsedArrival] = []
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    in_arrivals = False
+
+    line_regex = re.compile(
+        r"^(QFA)\s+(\d{3,4})\s+([IDR])\s+([A-Z]{3})\s+(\d{2}:\d{2})\s+([A-Z0-9]+)\s+(\d+)$"
+    )
+
+    for line in lines:
+        if line.startswith("Arrivals"):
+            in_arrivals = True
+            continue
+
+        if in_arrivals and line.startswith("Departure"):
+            break
+
+        if not in_arrivals:
+            continue
+
+        m = line_regex.match(line)
+        if not m:
+            continue
+
+        prefix, raw_flight_no, flight_type_code, route, sta, _reg, _pax = m.groups()
+
+        arrivals.append(
+            ParsedArrival(
+                task_date=task_date,
+                flight=normalize_flight(prefix, raw_flight_no),
+                flight_type=TYPE_LABELS.get(flight_type_code, flight_type_code),
+                route=route,
+                sta=sta,
+                source_file=source_file,
+            )
+        )
+
+    return arrivals
+
+
+def parse_pop_pdf(uploaded_file) -> list[ParsedArrival]:
+    file_bytes = uploaded_file.read()
+    text = extract_pdf_text(file_bytes)
+    return parse_arrivals_from_text(text, uploaded_file.name)
+
+
+# ------------------------------------------------------------
+# DATABASE ACTIONS
+# ------------------------------------------------------------
+
+def create_user(username: str, pin: str) -> tuple[bool, str]:
+    username = username.strip()
+    pin = pin.strip()
+
+    if not username:
+        return False, "Username is required."
+    if not re.fullmatch(r"\d{4}", pin):
+        return False, "PIN must be exactly 4 digits."
+
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO users (username, pin, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (username, pin, now_str()),
+            )
+            conn.commit()
+            return True, f"User '{username}' created."
+        except sqlite3.IntegrityError:
+            return False, "Username or PIN already exists."
+
+
+def delete_user(user_id: int) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+
+
+def get_all_users() -> list[sqlite3.Row]:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users ORDER BY username")
+        return cur.fetchall()
+
+
+def get_user_by_pin(pin: str) -> sqlite3.Row | None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE pin = ?", (pin,))
+        return cur.fetchone()
+
+
+def insert_tasks(parsed_arrivals: Iterable[ParsedArrival]) -> tuple[int, int]:
+    inserted = 0
+    skipped = 0
+
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+
+        for item in parsed_arrivals:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_date, flight, flight_type, route, sta, gate,
+                        source_file, status, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'Unassigned', ?)
+                    """,
+                    (
+                        item.task_date,
+                        item.flight,
+                        item.flight_type,
+                        item.route,
+                        item.sta,
+                        None,
+                        item.source_file,
+                        now_str(),
+                    ),
+                )
+                inserted += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+
+        conn.commit()
+
+    return inserted, skipped
+
+
+def get_tasks(task_date: str | None = None) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM tasks"
+    params: list[Any] = []
+
+    if task_date:
+        sql += " WHERE task_date = ?"
+        params.append(task_date)
+
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    return sorted(
+        rows,
+        key=lambda r: (
+            r["task_date"],
+            sort_sta_value(r["sta"]),
+            status_rank(r["status"]),
+            r["flight_type"],
+            r["flight"],
+        ),
+    )
+
+
+def assign_task_to_user(task_id: int, username: str) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'Assigned',
+                assigned_to = ?,
+                assigned_at = ?
+            WHERE id = ?
+              AND status = 'Unassigned'
+            """,
+            (username, now_str(), task_id),
+        )
+        conn.commit()
+
+
+def mark_ac_met(task_id: int, username: str) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'AC Met',
+                ac_met_by = ?,
+                ac_met_at = ?
+            WHERE id = ?
+              AND status IN ('Assigned', 'AC Met')
+              AND assigned_to = ?
+            """,
+            (username, now_str(), task_id, username),
+        )
+        conn.commit()
+
+
+def complete_task(task_id: int, username: str, notes: str) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'Completed',
+                completed_by = ?,
+                completed_at = ?,
+                notes = CASE
+                    WHEN notes IS NULL OR notes = '' THEN ?
+                    WHEN ? IS NULL OR ? = '' THEN notes
+                    ELSE notes || CHAR(10) || ?
+                END
+            WHERE id = ?
+              AND status IN ('Assigned', 'AC Met')
+              AND assigned_to = ?
+            """,
+            (
+                username,
+                now_str(),
+                notes.strip(),
+                notes.strip(),
+                notes.strip(),
+                notes.strip(),
+                task_id,
+                username,
+            ),
+        )
+        conn.commit()
+
+
+def skip_task(
+    task_id: int,
+    username: str,
+    reason: str,
+    other_reason: str,
+    notes: str,
+) -> None:
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'Skipped',
+                skipped_by = ?,
+                skipped_at = ?,
+                skip_reason = ?,
+                skip_other_reason = ?,
+                notes = CASE
+                    WHEN notes IS NULL OR notes = '' THEN ?
+                    WHEN ? IS NULL OR ? = '' THEN notes
+                    ELSE notes || CHAR(10) || ?
+                END
+            WHERE id = ?
+              AND status IN ('Unassigned', 'Assigned', 'AC Met')
+            """,
+            (
+                username,
+                now_str(),
+                reason,
+                other_reason.strip(),
+                notes.strip(),
+                notes.strip(),
+                notes.strip(),
+                notes.strip(),
+                task_id,
+            ),
+        )
+        conn.commit()
+
+
+def get_report_dataframe() -> pd.DataFrame:
+    with closing(get_conn()) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                task_date,
+                flight,
+                flight_type,
+                route,
+                sta,
+                gate,
+                source_file,
+                status,
+                assigned_to,
+                assigned_at,
+                ac_met_by,
+                ac_met_at,
+                completed_by,
+                completed_at,
+                skipped_by,
+                skipped_at,
+                skip_reason,
+                skip_other_reason,
+                notes,
+                created_at
+            FROM tasks
+            ORDER BY task_date, sta, flight
+            """,
+            conn,
+        )
+    return df
+
+
+# ------------------------------------------------------------
+# UI STYLES
+# ------------------------------------------------------------
+
+def inject_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .task-card {
+            border: 1px solid #d6dbe1;
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 12px;
+            background: #ffffff;
+        }
+        .task-head {
+            font-size: 1.15rem;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        .muted {
+            color: #586271;
+            font-size: 0.92rem;
+        }
+        .pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 0.82rem;
+            font-weight: 700;
+            margin-right: 6px;
+            margin-bottom: 6px;
+        }
+        .pill-unassigned { background: #fde8e8; color: #b42318; }
+        .pill-assigned   { background: #e0f2fe; color: #075985; }
+        .pill-met        { background: #fff7d6; color: #8a5b00; }
+        .pill-done       { background: #dcfce7; color: #166534; }
+        .pill-skip       { background: #f3e8ff; color: #6b21a8; }
+        .summary-box {
+            border: 1px solid #d6dbe1;
+            border-radius: 12px;
+            padding: 12px;
+            background: #fafafa;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def status_pill_html(status: str) -> str:
+    mapping = {
+        "Unassigned": "pill pill-unassigned",
+        "Assigned": "pill pill-assigned",
+        "AC Met": "pill pill-met",
+        "Completed": "pill pill-done",
+        "Skipped": "pill pill-skip",
+    }
+    css = mapping.get(status, "pill")
+    return f"<span class='{css}'>{status}</span>"
+
+
+# ------------------------------------------------------------
+# RENDER LOGIN
+# ------------------------------------------------------------
+
+def render_login() -> None:
+    st.title("Tranship Ops Dashboard")
+    st.caption("Enter your 4-digit code")
+
+    pin = st.text_input("PIN", type="password", max_chars=4)
+
+    if st.button("Login", use_container_width=True):
+        if pin == ADMIN_PIN:
+            st.session_state.role = "admin"
+            st.session_state.username = "Admin"
+            st.session_state.pin = pin
+            st.rerun()
+
+        user = get_user_by_pin(pin)
+        if user:
+            st.session_state.role = "user"
+            st.session_state.username = user["username"]
+            st.session_state.pin = pin
+            st.rerun()
+
+        st.error("Invalid PIN.")
+
+
+def logout() -> None:
+    st.session_state.role = None
+    st.session_state.username = None
+    st.session_state.pin = ""
+    st.rerun()
+
+
+# ------------------------------------------------------------
+# ADMIN UI
+# ------------------------------------------------------------
+
+def render_admin() -> None:
+    st.title("Admin")
+    st.caption("Upload POP sheets, manage users, and download reports.")
+
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.write(f"Logged in as **{st.session_state.username}**")
+    with col2:
+        if st.button("Logout", use_container_width=True):
+            logout()
+
+    tabs = st.tabs(["POP Upload", "Users", "Reports"])
+
+    # ---------------- POP Upload ----------------
+    with tabs[0]:
+        st.subheader("Upload OCC POP PDFs")
+        uploaded_files = st.file_uploader(
+            "Upload one or more POP PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
+
+        if uploaded_files and st.button("Generate Tasks from POP Sheets", use_container_width=True):
+            total_inserted = 0
+            total_skipped = 0
+            all_preview_rows: list[dict[str, str]] = []
+
+            for uploaded_file in uploaded_files:
+                try:
+                    arrivals = parse_pop_pdf(uploaded_file)
+                    inserted, skipped = insert_tasks(arrivals)
+                    total_inserted += inserted
+                    total_skipped += skipped
+
+                    for a in arrivals:
+                        all_preview_rows.append(
+                            {
+                                "Date": a.task_date,
+                                "Flight": a.flight,
+                                "Type": a.flight_type,
+                                "Route": a.route,
+                                "STA": a.sta,
+                                "Source": a.source_file,
+                            }
+                        )
+                except Exception as exc:
+                    st.error(f"Failed to process {uploaded_file.name}: {exc}")
+
+            st.success(
+                f"Task generation complete. Inserted: {total_inserted} | Duplicates skipped: {total_skipped}"
+            )
+
+            if all_preview_rows:
+                preview_df = pd.DataFrame(all_preview_rows)
+                preview_df = preview_df.sort_values(by=["Date", "STA", "Flight"])
+                st.dataframe(preview_df, use_container_width=True)
+
+    # ---------------- Users ----------------
+    with tabs[1]:
+        st.subheader("Create User")
+
+        with st.form("create_user_form"):
+            username = st.text_input("Username")
+            pin = st.text_input("4-digit PIN", max_chars=4)
+            submitted = st.form_submit_button("Create User", use_container_width=True)
+
+        if submitted:
+            ok, msg = create_user(username, pin)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        st.subheader("Existing Users")
+        users = get_all_users()
+
+        if not users:
+            st.info("No users created yet.")
+        else:
+            for user in users:
+                c1, c2, c3 = st.columns([4, 2, 1])
+                with c1:
+                    st.write(f"**{user['username']}**")
+                with c2:
+                    st.code(user["pin"])
+                with c3:
+                    if st.button("Delete", key=f"delete_user_{user['id']}", use_container_width=True):
+                        delete_user(user["id"])
+                        st.success(f"Deleted {user['username']}.")
+                        st.rerun()
+
+    # ---------------- Reports ----------------
+    with tabs[2]:
+        st.subheader("Download Report")
+        report_df = get_report_dataframe()
+
+        if report_df.empty:
+            st.info("No task data available yet.")
+        else:
+            st.dataframe(report_df, use_container_width=True, height=400)
+
+            csv_bytes = report_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV Report",
+                data=csv_bytes,
+                file_name=f"tranship_report_{today_str()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+
+# ------------------------------------------------------------
+# USER UI
+# ------------------------------------------------------------
+
+def render_summary_boxes(tasks: list[sqlite3.Row]) -> None:
+    total = len(tasks)
+    assigned = sum(1 for t in tasks if t["status"] == "Assigned")
+    met = sum(1 for t in tasks if t["status"] == "AC Met")
+    completed = sum(1 for t in tasks if t["status"] == "Completed")
+    skipped = sum(1 for t in tasks if t["status"] == "Skipped")
+    unassigned = sum(1 for t in tasks if t["status"] == "Unassigned")
+
+    cols = st.columns(6)
+    stats = [
+        ("Total", total),
+        ("Unassigned", unassigned),
+        ("Assigned", assigned),
+        ("AC Met", met),
+        ("Completed", completed),
+        ("Skipped", skipped),
+    ]
+    for col, (label, value) in zip(cols, stats):
+        with col:
+            st.markdown(
+                f"<div class='summary-box'><strong>{label}</strong><br>{value}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def render_task_card(task: sqlite3.Row, current_user: str) -> None:
+    st.markdown("<div class='task-card'>", unsafe_allow_html=True)
+
+    st.markdown(
+        f"<div class='task-head'>{task['flight']} {task['route']} - MEL</div>",
+        unsafe_allow_html=True,
+    )
+
+    meta_bits = [
+        f"Type: {task['flight_type']}",
+        f"STA: {task['sta']}",
+        f"Date: {task['task_date']}",
+    ]
+    if task["gate"]:
+        meta_bits.append(f"Gate: {task['gate']}")
+
+    st.markdown(
+        f"{status_pill_html(task['status'])}"
+        f"<span class='muted'>{' | '.join(meta_bits)}</span>",
+        unsafe_allow_html=True,
+    )
+
+    if task["assigned_to"]:
+        st.caption(f"Assigned to: {task['assigned_to']}")
+    if task["ac_met_by"]:
+        st.caption(f"AC Met by: {task['ac_met_by']}")
+    if task["completed_by"]:
+        st.caption(f"Completed by: {task['completed_by']}")
+    if task["skipped_by"]:
+        skip_text = task["skip_reason"] or "Skipped"
+        if task["skip_reason"] == "Other" and task["skip_other_reason"]:
+            skip_text = f"{skip_text} - {task['skip_other_reason']}"
+        st.caption(f"Skipped by: {task['skipped_by']} | Reason: {skip_text}")
+    if task["notes"]:
+        st.caption(f"Notes: {task['notes']}")
+
+    # ACTIONS
+    if task["status"] == "Unassigned":
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            if st.button("Assign to Self", key=f"assign_{task['id']}", use_container_width=True):
+                assign_task_to_user(task["id"], current_user)
+                st.rerun()
+
+        with c2:
+            with st.popover("Skip Flight", use_container_width=True):
+                skip_reason = st.selectbox(
+                    "Reason",
+                    SKIP_REASONS,
+                    key=f"skip_reason_unassigned_{task['id']}",
+                )
+                other_reason = ""
+                if skip_reason == "Other":
+                    other_reason = st.text_input(
+                        "Custom reason",
+                        key=f"skip_other_unassigned_{task['id']}",
+                    )
+                notes = st.text_area(
+                    "Notes (optional)",
+                    key=f"skip_notes_unassigned_{task['id']}",
+                )
+                if st.button("Confirm Skip", key=f"confirm_skip_unassigned_{task['id']}", use_container_width=True):
+                    skip_task(task["id"], current_user, skip_reason, other_reason, notes)
+                    st.rerun()
+
+    elif task["status"] in ("Assigned", "AC Met") and task["assigned_to"] == current_user:
+        c1, c2, c3 = st.columns([1, 1, 1])
+
+        with c1:
+            if task["status"] == "Assigned":
+                if st.button("AC Met", key=f"met_{task['id']}", use_container_width=True):
+                    mark_ac_met(task["id"], current_user)
+                    st.rerun()
+            else:
+                st.info("Aircraft met")
+
+        with c2:
+            with st.popover("Complete", use_container_width=True):
+                complete_notes = st.text_area(
+                    "Completion notes",
+                    key=f"complete_notes_{task['id']}",
+                    placeholder="Tail-to-tail drop, issues, comments...",
+                )
+                if st.button("Confirm Complete", key=f"confirm_complete_{task['id']}", use_container_width=True):
+                    complete_task(task["id"], current_user, complete_notes)
+                    st.rerun()
+
+        with c3:
+            with st.popover("Skip Flight", use_container_width=True):
+                skip_reason = st.selectbox(
+                    "Reason",
+                    SKIP_REASONS,
+                    key=f"skip_reason_assigned_{task['id']}",
+                )
+                other_reason = ""
+                if skip_reason == "Other":
+                    other_reason = st.text_input(
+                        "Custom reason",
+                        key=f"skip_other_assigned_{task['id']}",
+                    )
+                notes = st.text_area(
+                    "Notes (optional)",
+                    key=f"skip_notes_assigned_{task['id']}",
+                )
+                if st.button("Confirm Skip", key=f"confirm_skip_assigned_{task['id']}", use_container_width=True):
+                    skip_task(task["id"], current_user, skip_reason, other_reason, notes)
+                    st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_user() -> None:
+    st.title("Live Flight Board")
+
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.write(f"Logged in as **{st.session_state.username}**")
+    with col2:
+        if st.button("Logout", use_container_width=True):
+            logout()
+
+    all_tasks = get_tasks()
+    if not all_tasks:
+        st.info("No tasks loaded yet. Admin needs to upload POP sheets first.")
+        return
+
+    render_summary_boxes(all_tasks)
+
+    # Filters
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        selected_date = st.selectbox(
+            "Date",
+            options=sorted({t["task_date"] for t in all_tasks}),
+            index=0,
+        )
+    with c2:
+        selected_type = st.selectbox("Flight Type", ["ALL", "INT", "DOM", "QLK"], index=0)
+    with c3:
+        selected_view = st.selectbox(
+            "View",
+            ["ALL", "UNASSIGNED", "MY TASKS", "COMPLETED", "SKIPPED"],
+            index=0,
+        )
+
+    tasks = [t for t in all_tasks if t["task_date"] == selected_date]
+
+    if selected_type != "ALL":
+        tasks = [t for t in tasks if t["flight_type"] == selected_type]
+
+    current_user = st.session_state.username
+
+    if selected_view == "UNASSIGNED":
+        tasks = [t for t in tasks if t["status"] == "Unassigned"]
+    elif selected_view == "MY TASKS":
+        tasks = [
+            t for t in tasks
+            if t["assigned_to"] == current_user and t["status"] in ("Assigned", "AC Met")
+        ]
+    elif selected_view == "COMPLETED":
+        tasks = [t for t in tasks if t["status"] == "Completed"]
+    elif selected_view == "SKIPPED":
+        tasks = [t for t in tasks if t["status"] == "Skipped"]
+
+    tasks = sorted(
+        tasks,
+        key=lambda r: (
+            sort_sta_value(r["sta"]),
+            status_rank(r["status"]),
+            r["flight_type"],
+            r["flight"],
+        ),
+    )
+
+    if not tasks:
+        st.info("No tasks match the current filters.")
+        return
+
+    st.divider()
+    for task in tasks:
+        render_task_card(task, current_user)
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+
+def main() -> None:
+    st.set_page_config(page_title="Tranship Ops Dashboard", layout="wide")
+    init_db()
+    ensure_session_defaults()
+    inject_styles()
+
+    if st.session_state.role is None:
+        render_login()
+    elif st.session_state.role == "admin":
+        render_admin()
+    else:
+        render_user()
+
+
+if __name__ == "__main__":
+    main()
