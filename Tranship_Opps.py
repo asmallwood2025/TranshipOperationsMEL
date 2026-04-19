@@ -12,6 +12,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Any, Iterable
+from datetime import datetime, date, timedelta
 
 import pandas as pd
 import pdfplumber
@@ -124,6 +125,42 @@ class ParsedArrival:
 # ------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------
+
+def should_show_on_admin_active(task: sqlite3.Row) -> bool:
+    """
+    Admin active board rules:
+    - Unassigned, Assigned, AC Met, Skipped always show
+    - Completed shows for 5 minutes after completion, then disappears
+    """
+    status = task["status"]
+
+    if status in ("Unassigned", "Assigned", "AC Met", "Skipped"):
+        return True
+
+    if status == "Completed":
+        completed_at = task["completed_at"]
+        if not completed_at:
+            return False
+        try:
+            completed_dt = datetime.strptime(completed_at, "%Y-%m-%d %H:%M:%S")
+            return datetime.now() <= completed_dt + timedelta(minutes=5)
+        except ValueError:
+            return False
+
+    return False
+
+
+def admin_row_colour(status: str) -> str:
+    if status == "Unassigned":
+        return "#dbeafe"   # blue
+    if status in ("Assigned", "AC Met"):
+        return "#fef3c7"   # amber
+    if status == "Completed":
+        return "#dcfce7"   # green
+    if status == "Skipped":
+        return "#fee2e2"   # red
+    return "#ffffff"
+
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -759,34 +796,85 @@ def logout() -> None:
 
 def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
-    active_tasks = get_tasks(include_history=False)
-    
-    render_summary_boxes(get_tasks())
+
+    # Auto refresh every 15 seconds
+    st.markdown(
+        """
+        <meta http-equiv="refresh" content="15">
+        """,
+        unsafe_allow_html=True,
+    )
+
+    all_tasks = get_tasks()
+    active_tasks = [t for t in all_tasks if should_show_on_admin_active(t)]
+
+    render_summary_boxes(active_tasks)
 
     if not active_tasks:
         st.info("No active flights loaded.")
         return
 
-    rows = []
+    # Sort by date, STA, then flight
+    active_tasks = sorted(
+        active_tasks,
+        key=lambda r: (
+            r["task_date"],
+            sort_sta_value(r["sta"]),
+            r["flight_type"],
+            r["flight"],
+        ),
+    )
+
     for task in active_tasks:
-        rows.append(
-            {
-                "Date": task["task_date"],
-                "Flight": task["flight"],
-                "Type": task["flight_type"],
-                "Route": f"{task['route']} - MEL",
-                "STA": task["sta"],
-                "Status": task["status"],
-                "Assigned To": task["assigned_to"] or "",
-                "AC Met By": task["ac_met_by"] or "",
-            }
+        bg = admin_row_colour(task["status"])
+
+        assigned_text = task["assigned_to"] if task["assigned_to"] else "-"
+        ac_met_text = task["ac_met_by"] if task["ac_met_by"] else "-"
+        completed_text = task["completed_by"] if task["completed_by"] else "-"
+        skipped_text = task["skipped_by"] if task["skipped_by"] else "-"
+
+        extra_line = ""
+        if task["status"] == "Skipped":
+            reason = task["skip_reason"] or ""
+            if reason == "Other" and task["skip_other_reason"]:
+                reason = f"{reason} - {task['skip_other_reason']}"
+            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Skip reason: {reason}</div>"
+
+        if task["status"] == "Completed" and task["completed_at"]:
+            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Completed at: {task['completed_at']}</div>"
+
+        st.markdown(
+            f"""
+            <div style="
+                background:{bg};
+                border:1px solid #d6dbe1;
+                border-radius:12px;
+                padding:14px;
+                margin-bottom:12px;
+            ">
+                <div style="font-size:1.1rem; font-weight:700; margin-bottom:6px;">
+                    {task['flight']} {task['route']} - MEL
+                </div>
+                <div style="font-size:0.95rem; margin-bottom:6px;">
+                    <strong>Status:</strong> {task['status']} |
+                    <strong>Type:</strong> {task['flight_type']} |
+                    <strong>STA:</strong> {task['sta']} |
+                    <strong>Date:</strong> {task['task_date']}
+                </div>
+                <div style="font-size:0.92rem; color:#333;">
+                    <strong>Assigned:</strong> {assigned_text} |
+                    <strong>AC Met:</strong> {ac_met_text} |
+                    <strong>Completed:</strong> {completed_text} |
+                    <strong>Skipped:</strong> {skipped_text}
+                </div>
+                {extra_line}
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    df = pd.DataFrame(rows).sort_values(by=["Date", "STA", "Flight"])
-    st.dataframe(df, use_container_width=True, height=350)
-
     st.markdown("### Delete All Active Flights")
-    st.warning("This removes all active tasks and keeps completed/skipped history untouched.")
+    st.warning("This removes all live active tasks. Completed/skipped history remains available in reports.")
 
     if not st.session_state.confirm_delete_active:
         if st.button("Delete All Active Flights", use_container_width=True):
@@ -798,14 +886,12 @@ def render_admin_active_flights() -> None:
             if st.button("Confirm Delete Active Flights", use_container_width=True):
                 delete_all_active_tasks()
                 st.session_state.confirm_delete_active = False
-                st.success("All active flights deleted.")
+                st.success("Active flights deleted.")
                 st.rerun()
         with c2:
             if st.button("Cancel", key="cancel_delete_active", use_container_width=True):
                 st.session_state.confirm_delete_active = False
                 st.rerun()
-
-
 def render_admin() -> None:
     st.title("Admin")
     st.caption("Upload POP sheets, manage users, monitor active flights, and download reports.")
