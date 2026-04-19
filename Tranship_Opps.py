@@ -973,7 +973,7 @@ def logout() -> None:
 # ------------------------------------------------------------
 
 def render_admin_active_flights() -> None:
-    st.subheader("Live Active Flights")
+    st.subheader("Live Active Flights - Tranship")
 
     # Auto refresh every 15 seconds
     st_autorefresh(interval=5000, key="admin_live_refresh")
