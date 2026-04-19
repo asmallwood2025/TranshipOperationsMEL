@@ -126,6 +126,55 @@ class ParsedArrival:
 # HELPERS
 # ------------------------------------------------------------
 
+
+def should_show_on_admin_active(task: sqlite3.Row) -> bool:
+    status = task["status"]
+
+    if status in ("Unassigned", "Assigned", "AC Met", "Skipped"):
+        return True
+
+    if status == "Completed":
+        completed_at = task["completed_at"]
+        if not completed_at:
+            return False
+        try:
+            completed_dt = datetime.strptime(completed_at, "%Y-%m-%d %H:%M:%S")
+            return datetime.now() <= completed_dt + timedelta(minutes=5)
+        except ValueError:
+            return False
+
+    return False
+
+
+def admin_board_class(status: str) -> str:
+    if status == "Unassigned":
+        return "unassigned"
+    if status == "Assigned":
+        return "assigned"
+    if status == "AC Met":
+        return "met"
+    if status == "Completed":
+        return "completed"
+    if status == "Skipped":
+        return "skipped"
+    return "unassigned"
+
+
+def admin_status_class(status: str) -> str:
+    if status == "Unassigned":
+        return "status-unassigned"
+    if status == "Assigned":
+        return "status-assigned"
+    if status == "AC Met":
+        return "status-met"
+    if status == "Completed":
+        return "status-completed"
+    if status == "Skipped":
+        return "status-skipped"
+    return "status-unassigned"
+
+
+
 def should_show_on_admin_active(task: sqlite3.Row) -> bool:
     """
     Admin active board rules:
@@ -697,27 +746,19 @@ def delete_all_active_tasks() -> None:
 # ------------------------------------------------------------
 # UI STYLES
 # ------------------------------------------------------------
-
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        .task-card {
-            border: 1px solid #d6dbe1;
-            border-radius: 12px;
-            padding: 14px;
-            margin-bottom: 12px;
-            background: #ffffff;
+        .stApp {
+            background-color: #0b1220;
         }
-        .task-head {
-            font-size: 1.15rem;
-            font-weight: 700;
-            margin-bottom: 6px;
-        }
+
         .muted {
-            color: #586271;
+            color: #94a3b8;
             font-size: 0.92rem;
         }
+
         .pill {
             display: inline-block;
             padding: 4px 10px;
@@ -727,23 +768,147 @@ def inject_styles() -> None:
             margin-right: 6px;
             margin-bottom: 6px;
         }
-        .pill-unassigned { background: #fde8e8; color: #b42318; }
-        .pill-assigned   { background: #e0f2fe; color: #075985; }
-        .pill-met        { background: #fff7d6; color: #8a5b00; }
-        .pill-done       { background: #dcfce7; color: #166534; }
-        .pill-skip       { background: #f3e8ff; color: #6b21a8; }
+        .pill-unassigned { background: #dbeafe; color: #1d4ed8; }
+        .pill-assigned   { background: #fef3c7; color: #b45309; }
+        .pill-met        { background: #fde68a; color: #92400e; }
+        .pill-done       { background: #dcfce7; color: #15803d; }
+        .pill-skip       { background: #fee2e2; color: #b91c1c; }
+
         .summary-box {
-            border: 1px solid #d6dbe1;
-            border-radius: 12px;
-            padding: 12px;
-            background: #fafafa;
+            border: 1px solid #243041;
+            border-radius: 14px;
+            padding: 14px;
+            background: #111827;
+            color: #e5e7eb;
+            min-height: 90px;
+        }
+
+        .board-wrap {
+            margin-top: 8px;
+        }
+
+        .board-card {
+            border-radius: 16px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.16);
+        }
+
+        .board-card.unassigned {
+            background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+            border-left: 8px solid #3b82f6;
+        }
+
+        .board-card.assigned {
+            background: linear-gradient(135deg, #1f2937 0%, #78350f 100%);
+            border-left: 8px solid #f59e0b;
+        }
+
+        .board-card.met {
+            background: linear-gradient(135deg, #292524 0%, #a16207 100%);
+            border-left: 8px solid #fbbf24;
+        }
+
+        .board-card.completed {
+            background: linear-gradient(135deg, #0f172a 0%, #14532d 100%);
+            border-left: 8px solid #22c55e;
+        }
+
+        .board-card.skipped {
+            background: linear-gradient(135deg, #1f1722 0%, #7f1d1d 100%);
+            border-left: 8px solid #ef4444;
+        }
+
+        .board-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+
+        .board-flight {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: white;
+            line-height: 1.2;
+        }
+
+        .board-status {
+            font-size: 0.85rem;
+            font-weight: 800;
+            padding: 5px 10px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+
+        .status-unassigned { background: #dbeafe; color: #1d4ed8; }
+        .status-assigned   { background: #fef3c7; color: #b45309; }
+        .status-met        { background: #fde68a; color: #92400e; }
+        .status-completed  { background: #dcfce7; color: #15803d; }
+        .status-skipped    { background: #fee2e2; color: #b91c1c; }
+
+        .board-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .meta-chip {
+            background: rgba(255,255,255,0.08);
+            color: #e5e7eb;
+            padding: 6px 10px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .board-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .board-field {
+            background: rgba(255,255,255,0.06);
+            border-radius: 10px;
+            padding: 8px 10px;
+        }
+
+        .board-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #cbd5e1;
+            margin-bottom: 2px;
+            font-weight: 700;
+        }
+
+        .board-value {
+            color: white;
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+
+        .board-note {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.08);
+            color: #f8fafc;
+            font-size: 0.9rem;
+        }
+
+        div[data-testid="stTabs"] button {
+            font-weight: 700;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-
 def status_pill_html(status: str) -> str:
     mapping = {
         "Unassigned": "pill pill-unassigned",
@@ -797,7 +962,6 @@ def logout() -> None:
 def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
 
-    # Auto refresh every 15 seconds
     st.markdown(
         """
         <meta http-equiv="refresh" content="15">
@@ -814,65 +978,140 @@ def render_admin_active_flights() -> None:
         st.info("No active flights loaded.")
         return
 
-    # Sort by date, STA, then flight
-    active_tasks = sorted(
-        active_tasks,
+    # Filters
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        selected_date = st.selectbox(
+            "Date",
+            options=sorted({t["task_date"] for t in active_tasks}),
+            index=0,
+            key="admin_active_date",
+        )
+    with c2:
+        selected_type = st.selectbox(
+            "Flight Type",
+            ["ALL", "INT", "DOM", "QLK"],
+            index=0,
+            key="admin_active_type",
+        )
+    with c3:
+        selected_status = st.selectbox(
+            "Status",
+            ["ALL", "Unassigned", "Assigned", "AC Met", "Completed", "Skipped"],
+            index=0,
+            key="admin_active_status",
+        )
+
+    filtered = [t for t in active_tasks if t["task_date"] == selected_date]
+
+    if selected_type != "ALL":
+        filtered = [t for t in filtered if t["flight_type"] == selected_type]
+
+    if selected_status != "ALL":
+        filtered = [t for t in filtered if t["status"] == selected_status]
+
+    filtered = sorted(
+        filtered,
         key=lambda r: (
-            r["task_date"],
             sort_sta_value(r["sta"]),
             r["flight_type"],
             r["flight"],
         ),
     )
 
-    for task in active_tasks:
-        bg = admin_row_colour(task["status"])
+    st.markdown("<div class='board-wrap'>", unsafe_allow_html=True)
 
-        assigned_text = task["assigned_to"] if task["assigned_to"] else "-"
-        ac_met_text = task["ac_met_by"] if task["ac_met_by"] else "-"
-        completed_text = task["completed_by"] if task["completed_by"] else "-"
-        skipped_text = task["skipped_by"] if task["skipped_by"] else "-"
+    for task in filtered:
+        board_class = admin_board_class(task["status"])
+        status_class = admin_status_class(task["status"])
 
-        extra_line = ""
+        skip_reason = ""
         if task["status"] == "Skipped":
-            reason = task["skip_reason"] or ""
-            if reason == "Other" and task["skip_other_reason"]:
-                reason = f"{reason} - {task['skip_other_reason']}"
-            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Skip reason: {reason}</div>"
+            skip_reason = task["skip_reason"] or ""
+            if skip_reason == "Other" and task["skip_other_reason"]:
+                skip_reason = f"{skip_reason} - {task['skip_other_reason']}"
 
+        note_lines = []
         if task["status"] == "Completed" and task["completed_at"]:
-            extra_line = f"<div style='margin-top:6px; font-size:0.9rem; color:#444;'>Completed at: {task['completed_at']}</div>"
+            note_lines.append(f"Completed at: {task['completed_at']}")
+        if task["status"] == "Skipped" and skip_reason:
+            note_lines.append(f"Skip reason: {skip_reason}")
+        if task["notes"]:
+            note_lines.append(f"Notes: {task['notes']}")
+
+        note_html = ""
+        if note_lines:
+            note_html = "<div class='board-note'>" + "<br>".join(note_lines) + "</div>"
 
         st.markdown(
             f"""
-            <div style="
-                background:{bg};
-                border:1px solid #d6dbe1;
-                border-radius:12px;
-                padding:14px;
-                margin-bottom:12px;
-            ">
-                <div style="font-size:1.1rem; font-weight:700; margin-bottom:6px;">
-                    {task['flight']} {task['route']} - MEL
+            <div class="board-card {board_class}">
+                <div class="board-top">
+                    <div class="board-flight">{task['flight']} {task['route']} - MEL</div>
+                    <div class="board-status {status_class}">{task['status']}</div>
                 </div>
-                <div style="font-size:0.95rem; margin-bottom:6px;">
-                    <strong>Status:</strong> {task['status']} |
-                    <strong>Type:</strong> {task['flight_type']} |
-                    <strong>STA:</strong> {task['sta']} |
-                    <strong>Date:</strong> {task['task_date']}
+
+                <div class="board-meta">
+                    <div class="meta-chip">Type: {task['flight_type']}</div>
+                    <div class="meta-chip">STA: {task['sta']}</div>
+                    <div class="meta-chip">Date: {task['task_date']}</div>
+                    {f"<div class='meta-chip'>Gate: {task['gate']}</div>" if task['gate'] else ""}
                 </div>
-                <div style="font-size:0.92rem; color:#333;">
-                    <strong>Assigned:</strong> {assigned_text} |
-                    <strong>AC Met:</strong> {ac_met_text} |
-                    <strong>Completed:</strong> {completed_text} |
-                    <strong>Skipped:</strong> {skipped_text}
+
+                <div class="board-grid">
+                    <div class="board-field">
+                        <div class="board-label">Assigned To</div>
+                        <div class="board-value">{task['assigned_to'] or '-'}</div>
+                    </div>
+                    <div class="board-field">
+                        <div class="board-label">Assigned At</div>
+                        <div class="board-value">{task['assigned_at'] or '-'}</div>
+                    </div>
+                    <div class="board-field">
+                        <div class="board-label">AC Met By</div>
+                        <div class="board-value">{task['ac_met_by'] or '-'}</div>
+                    </div>
+                    <div class="board-field">
+                        <div class="board-label">AC Met At</div>
+                        <div class="board-value">{task['ac_met_at'] or '-'}</div>
+                    </div>
+                    <div class="board-field">
+                        <div class="board-label">Completed By</div>
+                        <div class="board-value">{task['completed_by'] or '-'}</div>
+                    </div>
+                    <div class="board-field">
+                        <div class="board-label">Skipped By</div>
+                        <div class="board-value">{task['skipped_by'] or '-'}</div>
+                    </div>
                 </div>
-                {extra_line}
+
+                {note_html}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### Delete All Active Flights")
+    st.warning("This removes all live active tasks. Completed/skipped history remains available in reports.")
+
+    if not st.session_state.confirm_delete_active:
+        if st.button("Delete All Active Flights", use_container_width=True):
+            st.session_state.confirm_delete_active = True
+            st.rerun()
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Confirm Delete Active Flights", use_container_width=True):
+                delete_all_active_tasks()
+                st.session_state.confirm_delete_active = False
+                st.success("Active flights deleted.")
+                st.rerun()
+        with c2:
+            if st.button("Cancel", key="cancel_delete_active", use_container_width=True):
+                st.session_state.confirm_delete_active = False
+                st.rerun()
     st.markdown("### Delete All Active Flights")
     st.warning("This removes all live active tasks. Completed/skipped history remains available in reports.")
 
