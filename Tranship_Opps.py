@@ -760,6 +760,8 @@ def logout() -> None:
 def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
     active_tasks = get_tasks(include_history=False)
+    
+    render_summary_boxes(get_tasks())
 
     if not active_tasks:
         st.info("No active flights loaded.")
@@ -1101,8 +1103,6 @@ def render_user() -> None:
         st.info("No tasks loaded yet. Admin needs to upload POP sheets first.")
         return
 
-    render_summary_boxes(all_tasks)
-
     tabs = st.tabs(["Active Flights", "History"])
 
     current_user = st.session_state.username
@@ -1142,9 +1142,11 @@ def render_user() -> None:
                 if t["assigned_to"] == current_user and t["status"] in ("Assigned", "AC Met")
             ]
 
+
         active_tasks = sorted(
             active_tasks,
             key=lambda r: (
+                0 if r["assigned_to"] == current_user and r["status"] in ("Assigned", "AC Met") else 1,
                 sort_sta_value(r["sta"]),
                 status_rank(r["status"]),
                 r["flight_type"],
