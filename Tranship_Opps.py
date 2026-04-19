@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Any, Iterable
 from datetime import datetime, date, timedelta
+from streamlit_autorefresh import st_autorefresh
 
 import pandas as pd
 import pdfplumber
@@ -917,12 +918,7 @@ def render_admin_active_flights() -> None:
     st.subheader("Live Active Flights")
 
     # Auto refresh every 15 seconds
-    st.markdown(
-        """
-        <meta http-equiv="refresh" content="15">
-        """,
-        unsafe_allow_html=True,
-    )
+    st_autorefresh(interval=15000, key="admin_live_refresh")
 
     all_tasks = get_tasks()
     active_tasks = [t for t in all_tasks if should_show_on_admin_active(t)]
