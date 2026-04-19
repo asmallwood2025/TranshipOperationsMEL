@@ -207,8 +207,55 @@ def looks_like_time(value: str) -> bool:
     return bool(re.fullmatch(r"\d{2}:\d{2}", value.strip()))
 
 
-def looks_like_flight_prefix(value: str) -> bool:
-    return value.strip().upper() in {"QFA", "QF"}
+def parse_arrival_row_from_left_side(
+    cells: list[str],
+    task_date: str,
+    source_file: str,
+) -> ParsedArrival | None:
+    """
+    Expected arrivals side layout:
+    [Flight, HFT, Route, STA, ATA, REG, Pax, ...]
+    Example:
+    ['QFA 0036', 'I', 'SIN', '05:35', '', 'VHEBK', '269', ...]
+    """
+    if len(cells) < 4:
+        return None
+
+    flight_cell = clean_cell(cells[0]).upper()
+    flight_type_code = clean_cell(cells[1]).upper()
+    route = clean_cell(cells[2]).upper()
+    sta = clean_cell(cells[3])
+
+    # Skip junk/header rows
+    if not flight_cell:
+        return None
+    if flight_cell in {"PORT OPERATING PLAN", "ARRIVALS", "FLIGHT"}:
+        return None
+    if "DATE:" in flight_cell or "FLIGHT TYPE:" in flight_cell:
+        return None
+
+    # Must look like "QFA 0036" or "QF 36"
+    m = re.fullmatch(r"(QFA|QF)\s*(\d{3,4})", flight_cell)
+    if not m:
+        return None
+
+    if flight_type_code not in TYPE_LABELS:
+        return None
+    if not re.fullmatch(r"[A-Z]{3}", route):
+        return None
+    if not looks_like_time(sta):
+        return None
+
+    prefix, raw_number = m.groups()
+
+    return ParsedArrival(
+        task_date=task_date,
+        flight=normalize_flight(prefix, raw_number),
+        flight_type=TYPE_LABELS[flight_type_code],
+        route=route,
+        sta=sta,
+        source_file=source_file,
+    )
 
 
 def parse_arrivals_from_tables(file_bytes: bytes, source_file: str) -> list[ParsedArrival]:
@@ -220,82 +267,68 @@ def parse_arrivals_from_tables(file_bytes: bytes, source_file: str) -> list[Pars
 
         for page in pdf.pages:
             tables = page.extract_tables() or []
+
             for table in tables:
-                if not table:
-                    continue
-
                 for row in table:
-                    cells = [clean_cell(c) for c in row if clean_cell(c) != ""]
-
-                    # Expecting rows like:
-                    # QFA | 0036 | I | SIN | 05:35 | VHEBK | 269
-                    if len(cells) < 5:
+                    if not row:
                         continue
 
-                    # Skip headers / junk rows
-                    joined = " ".join(cells).upper()
-                    if "FLIGHT" in joined and "ROUTE" in joined:
-                        continue
-                    if joined.startswith("DEPARTURE"):
-                        continue
-                    if joined.startswith("ARRIVALS"):
-                        continue
-                    if joined.startswith("PORT OPERATING PLAN"):
-                        continue
+                    # Keep raw column positions so we can split left/right halves
+                    row_cells = [clean_cell(c) for c in row]
 
-                    prefix = cells[0].upper()
-
-                    if not looks_like_flight_prefix(prefix):
-                        continue
-
-                    raw_number = cells[1]
-                    flight_type_code = cells[2].upper()
-                    route = cells[3].upper()
-                    sta = cells[4]
-
-                    if flight_type_code not in TYPE_LABELS:
-                        continue
-                    if not re.fullmatch(r"\d{3,4}", raw_number):
-                        continue
-                    if not re.fullmatch(r"[A-Z]{3}", route):
-                        continue
-                    if not looks_like_time(sta):
-                        continue
-
-                    arrivals.append(
-                        ParsedArrival(
-                            task_date=task_date,
-                            flight=normalize_flight(prefix, raw_number),
-                            flight_type=TYPE_LABELS[flight_type_code],
-                            route=route,
-                            sta=sta,
-                            source_file=source_file,
+                    # Most POP tables are 16 columns wide:
+                    # left 8 = arrivals, right 8 = departures
+                    #
+                    # We ONLY want the left side.
+                    if len(row_cells) >= 8:
+                        left_side = row_cells[:8]
+                        parsed = parse_arrival_row_from_left_side(
+                            left_side,
+                            task_date,
+                            source_file,
                         )
-                    )
+                        if parsed:
+                            arrivals.append(parsed)
+                    else:
+                        # fallback for odd rows
+                        parsed = parse_arrival_row_from_left_side(
+                            row_cells,
+                            task_date,
+                            source_file,
+                        )
+                        if parsed:
+                            arrivals.append(parsed)
 
+    # de-duplicate
     deduped = {
         (a.task_date, a.flight, a.flight_type, a.route, a.sta): a
         for a in arrivals
     }
-    return list(deduped.values())
+
+    return sorted(
+        deduped.values(),
+        key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight),
+    )
 
 
 def parse_arrivals_from_text(text: str, source_file: str) -> list[ParsedArrival]:
+    """
+    Fallback only.
+    """
     task_date = detect_pop_date(text)
     arrivals: list[ParsedArrival] = []
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
     line_regex = re.compile(
-        r"^(QFA|QF)\s+(\d{3,4})\s+([IDR])\s+([A-Z]{3})\s+(\d{2}:\d{2})\s+([A-Z0-9]+)\s+(\d+)$"
+        r"^(QFA|QF)\s+(\d{3,4})\s+([IDR])\s+([A-Z]{3})\s+(\d{2}:\d{2})\s+[A-Z0-9]+\s+\d+$"
     )
 
-    for line in lines:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         m = line_regex.match(line)
         if not m:
             continue
 
-        prefix, raw_flight_no, flight_type_code, route, sta, _reg, _pax = m.groups()
+        prefix, raw_flight_no, flight_type_code, route, sta = m.groups()
 
         arrivals.append(
             ParsedArrival(
@@ -312,22 +345,24 @@ def parse_arrivals_from_text(text: str, source_file: str) -> list[ParsedArrival]
         (a.task_date, a.flight, a.flight_type, a.route, a.sta): a
         for a in arrivals
     }
-    return list(deduped.values())
+
+    return sorted(
+        deduped.values(),
+        key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight),
+    )
 
 
 def parse_pop_pdf(uploaded_file) -> list[ParsedArrival]:
     file_bytes = uploaded_file.read()
 
+    # Primary parser
     arrivals = parse_arrivals_from_tables(file_bytes, uploaded_file.name)
     if arrivals:
-        return sorted(arrivals, key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight))
+        return arrivals
 
-    # fallback if table extraction fails
+    # Fallback parser
     text = extract_pdf_text(file_bytes)
-    arrivals = parse_arrivals_from_text(text, uploaded_file.name)
-    return sorted(arrivals, key=lambda x: (x.task_date, sort_sta_value(x.sta), x.flight))
-
-
+    return parse_arrivals_from_text(text, uploaded_file.name)
 # ------------------------------------------------------------
 # DATABASE ACTIONS
 # ------------------------------------------------------------
