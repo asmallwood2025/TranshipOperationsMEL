@@ -706,7 +706,7 @@ def inject_styles() -> None:
         """
         <style>
         .stApp {
-            background-color: #0b1220;
+            background-color: #ffffff;
         }
 
         .muted {
